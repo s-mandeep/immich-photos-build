@@ -1,0 +1,78 @@
+name: iOS unsigned IPA (fork)
+
+# Fork (mandeep/photos): builds an UNSIGNED Runner.ipa for SideStore / AltStore to re-sign.
+# Manual trigger only.
+on:
+  workflow_dispatch:
+  push:
+    branches: [mandeep/photos]
+    paths: ['mobile/**', '.github/workflows/ios-unsigned.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios-unsigned:
+    name: Build unsigned iOS IPA
+    runs-on: macos-15-intel   # x86 Mac pool: on 6 Nov 00:00 IST the arm64 pool never picked the job up (capacity notice)
+    timeout-minutes: 90
+    env:
+      # pnpm 11 has no darwin/amd64 build; the mobile build and its Dart codegen do not use it
+      MISE_DISABLE_TOOLS: pnpm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up mise (Flutter 3.47.2, Java, openapi generator per mise.toml)
+        uses: jdx/mise-action@v2
+        with:
+          working_directory: ./mobile
+
+      - name: Install Flutter dependencies
+        working-directory: ./mobile
+        run: mise run install:ci
+
+      - name: Stub pnpm (only used to re-format translation JSON, which is committed formatted)
+        run: |
+          mkdir -p "$HOME/pnpm-stub"
+          printf '#!/bin/sh\necho "pnpm stub: skipped $*"\n' > "$HOME/pnpm-stub/pnpm"
+          chmod +x "$HOME/pnpm-stub/pnpm"
+          echo "$HOME/pnpm-stub" >> "$GITHUB_PATH"
+
+      - name: Code generation (openapi, drift, freezed, pigeon, translations)
+        working-directory: ./mobile
+        run: mise run codegen
+
+      - name: Run fork unit tests
+        working-directory: ./mobile
+        run: flutter test test/unit/mirror_sync_planner_test.dart test/unit/library_link_matcher_test.dart test/unit/library_album_planner_test.dart
+
+      - name: Select newest Xcode on the runner (device_info_plus needs the iOS 26+ SDK)
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Selecting $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          xcodebuild -version
+
+      - name: Build iOS (release, no codesign)
+        working-directory: ./mobile
+        run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        working-directory: ./mobile
+        run: |
+          rm -rf Payload Runner-unsigned.ipa
+          mkdir Payload
+          cp -R build/ios/iphoneos/*.app Payload/   # the app bundle is named Immich.app
+          zip -qry Runner-unsigned.ipa Payload
+          ls -la Runner-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: immich-fork-ios-unsigned
+          path: mobile/Runner-unsigned.ipa
+          retention-days: 14

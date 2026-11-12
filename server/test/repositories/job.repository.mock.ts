@@ -1,0 +1,26 @@
+import { Mocked, vitest } from 'vitest';
+import type { RepositoryInterface } from 'src/types.js';
+import { JobRepository } from 'src/repositories/job.repository.js';
+
+export const newJobRepositoryMock = (): Mocked<RepositoryInterface<JobRepository>> => {
+  return {
+    setup: vitest.fn(),
+    startWorkers: vitest.fn(),
+    watchWorkers: vitest.fn(),
+    teardown: vitest.fn(),
+    run: vitest.fn(),
+    setConcurrency: vitest.fn(),
+    empty: vitest.fn(),
+    pause: vitest.fn(),
+    resume: vitest.fn(),
+    searchJobs: vitest.fn(),
+    queue: vitest.fn().mockImplementation(() => Promise.resolve()),
+    queueAll: vitest.fn().mockImplementation(() => Promise.resolve()),
+    isActive: vitest.fn(),
+    isPaused: vitest.fn(),
+    getJobCounts: vitest.fn(),
+    clear: vitest.fn(),
+    waitForQueueCompletion: vitest.fn(),
+    removeJob: vitest.fn(),
+  };
+};

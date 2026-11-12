@@ -1,0 +1,51 @@
+import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import { ApiTags } from '@nestjs/swagger';
+import type { AuthDto } from 'src/dtos/auth.dto.js';
+import { Endpoint, HistoryBuilder } from 'src/decorators.js';
+import { BulkIdsDto } from 'src/dtos/asset-ids.response.dto.js';
+import { TrashResponseDto } from 'src/dtos/trash.dto.js';
+import { ApiTag, Permission } from 'src/enum.js';
+import { Auth, Authenticated } from 'src/middleware/auth.guard.js';
+import { TrashService } from 'src/services/trash.service.js';
+
+@ApiTags(ApiTag.Trash)
+@Controller('trash')
+export class TrashController {
+  constructor(private service: TrashService) {}
+
+  @Post('empty')
+  @Authenticated({ permission: Permission.AssetDelete })
+  @HttpCode(HttpStatus.OK)
+  @Endpoint({
+    summary: 'Empty trash',
+    description: 'Permanently delete all items in the trash.',
+    history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
+  })
+  emptyTrash(@Auth() auth: AuthDto): Promise<TrashResponseDto> {
+    return this.service.empty(auth);
+  }
+
+  @Post('restore')
+  @Authenticated({ permission: Permission.AssetDelete })
+  @HttpCode(HttpStatus.OK)
+  @Endpoint({
+    summary: 'Restore trash',
+    description: 'Restore all items in the trash.',
+    history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
+  })
+  restoreTrash(@Auth() auth: AuthDto): Promise<TrashResponseDto> {
+    return this.service.restore(auth);
+  }
+
+  @Post('restore/assets')
+  @Authenticated({ permission: Permission.AssetDelete })
+  @HttpCode(HttpStatus.OK)
+  @Endpoint({
+    summary: 'Restore assets',
+    description: 'Restore specific assets from the trash.',
+    history: new HistoryBuilder().added('v1').beta('v1').stable('v2'),
+  })
+  restoreAssets(@Auth() auth: AuthDto, @Body() dto: BulkIdsDto): Promise<TrashResponseDto> {
+    return this.service.restoreAssets(auth, dto);
+  }
+}

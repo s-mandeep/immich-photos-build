@@ -1,0 +1,166 @@
+import { AssetVisibility, LoginResponseDto } from '@immich/sdk';
+import { readFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
+import { Socket } from 'socket.io-client';
+import { createUserDto } from 'src/fixtures.js';
+import { app, testAssetDir, utils } from 'src/utils.js';
+import request from 'supertest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+describe('/map', () => {
+  let websocket: Socket;
+  let partnerWebsocket: Socket;
+  let admin: LoginResponseDto;
+  let partner: LoginResponseDto;
+  let partnerArchivedAssetId: string;
+  let adminArchivedAssetId: string;
+
+  beforeAll(async () => {
+    await utils.resetDatabase();
+    admin = await utils.adminSetup({ onboarding: false });
+    partner = await utils.userSetup(admin.accessToken, createUserDto.user1);
+
+    websocket = await utils.connectWebsocket(admin.accessToken);
+    partnerWebsocket = await utils.connectWebsocket(partner.accessToken);
+
+    const adminFiles = ['formats/heic/IMG_2682.heic', 'metadata/gps-position/thompson-springs.jpg'];
+    const adminArchivedFile = 'metadata/dates/datetimeoriginal-gps.jpg';
+    const partnerFile = 'metadata/gps-position/thompson-springs.jpg';
+    utils.resetEvents();
+    const uploadFile = async (accessToken: string, input: string) => {
+      const filepath = join(testAssetDir, input);
+      const { id } = await utils.createAsset(accessToken, {
+        assetData: { bytes: await readFile(filepath), filename: basename(filepath) },
+      });
+      await utils.waitForWebsocketEvent({ event: 'assetUpload', id });
+      return id;
+    };
+    await Promise.all(adminFiles.map((f) => uploadFile(admin.accessToken, f)));
+    [adminArchivedAssetId, partnerArchivedAssetId] = await Promise.all([
+      uploadFile(admin.accessToken, adminArchivedFile),
+      uploadFile(partner.accessToken, partnerFile),
+    ]);
+
+    await Promise.all([
+      utils.archiveAssets(admin.accessToken, [adminArchivedAssetId]),
+      utils.archiveAssets(partner.accessToken, [partnerArchivedAssetId]),
+      utils.createPartner(partner.accessToken, admin.userId),
+    ]);
+  });
+
+  afterAll(() => {
+    utils.disconnectWebsocket(websocket);
+    utils.disconnectWebsocket(partnerWebsocket);
+  });
+
+  describe('GET /map/markers', () => {
+    it('should get map markers for all non-archived assets', async () => {
+      const { status, body } = await request(app)
+        .get('/map/markers')
+        .query({ visibility: AssetVisibility.Timeline })
+        .set('Authorization', `Bearer ${admin.accessToken}`);
+
+      expect(status).toBe(200);
+      expect(body).toHaveLength(2);
+      expect(body).toEqual([
+        {
+          city: 'Palisade',
+          country: 'United States',
+          id: expect.any(String),
+          lat: expect.closeTo(39.115),
+          lon: expect.closeTo(-108.400968),
+          state: 'Colorado',
+        },
+        {
+          city: 'Ralston',
+          country: 'United States',
+          id: expect.any(String),
+          lat: expect.closeTo(41.2203),
+          lon: expect.closeTo(-96.071625),
+          state: 'Nebraska',
+        },
+      ]);
+    });
+
+    it('should not expose partner archived asset locations', async () => {
+      const { status, body } = await request(app)
+        .get('/map/markers')
+        .query({ withPartners: true, isArchived: true })
+        .set('Authorization', `Bearer ${admin.accessToken}`);
+
+      expect(status).toBe(200);
+      const ids = body.map((m: { id: string }) => m.id);
+      expect(ids).not.toContain(partnerArchivedAssetId);
+      expect(ids).toContain(adminArchivedAssetId);
+    });
+
+    it('should include own archived asset locations', async () => {
+      const { status, body } = await request(app)
+        .get('/map/markers')
+        .query({ isArchived: true })
+        .set('Authorization', `Bearer ${admin.accessToken}`);
+
+      expect(status).toBe(200);
+      expect(body.map((m: { id: string }) => m.id)).toContain(adminArchivedAssetId);
+    });
+
+    it('should get all map markers', async () => {
+      const { status, body } = await request(app)
+        .get('/map/markers')
+        .set('Authorization', `Bearer ${admin.accessToken}`);
+
+      expect(status).toBe(200);
+      expect(body).toEqual([
+        {
+          city: 'Palisade',
+          country: 'United States',
+          id: expect.any(String),
+          lat: expect.closeTo(39.115),
+          lon: expect.closeTo(-108.400968),
+          state: 'Colorado',
+        },
+        {
+          city: 'Ralston',
+          country: 'United States',
+          id: expect.any(String),
+          lat: expect.closeTo(41.2203),
+          lon: expect.closeTo(-96.071625),
+          state: 'Nebraska',
+        },
+      ]);
+    });
+  });
+
+  describe('GET /map/reverse-geocode', () => {
+    const reverseGeocodeTestCases = [
+      {
+        name: 'Vaucluse',
+        lat: -33.85897705866313,
+        lon: 151.27849073027048,
+        results: [{ city: 'Vaucluse', state: 'New South Wales', country: 'Australia' }],
+      },
+      {
+        name: 'Ravenhall',
+        lat: -37.76573239917475,
+        lon: 144.7524531648833,
+        results: [{ city: 'Ravenhall', state: 'Victoria', country: 'Australia' }],
+      },
+      {
+        name: 'Scarborough',
+        lat: -31.894346156789997,
+        lon: 115.75761710390464,
+        results: [{ city: 'Scarborough', state: 'Western Australia', country: 'Australia' }],
+      },
+    ];
+
+    it.each(reverseGeocodeTestCases)(`should resolve to $name`, async ({ lat, lon, results }) => {
+      const { status, body } = await request(app)
+        .get(`/map/reverse-geocode?lat=${lat}&lon=${lon}`)
+        .set('Authorization', `Bearer ${admin.accessToken}`);
+      expect(status).toBe(200);
+      expect(Array.isArray(body)).toBe(true);
+      expect(body.length).toBe(results.length);
+      expect(body).toEqual(results);
+    });
+  });
+});

@@ -1,0 +1,110 @@
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { isEqual } from 'lodash-es';
+import type { ArgOf } from 'src/repositories/event.repository.js';
+import { OnEvent } from 'src/decorators.js';
+import {
+  AdminConfigDto,
+  PublicConfigDto,
+  UserConfigDto,
+  defaults,
+  mapAdminConfig,
+  mapPublicConfig,
+  mapUserConfig,
+} from 'src/dtos/config.dto.js';
+import { BootstrapEventPriority } from 'src/enum.js';
+import { BaseService } from 'src/services/base.service.js';
+import { clearConfigCache } from 'src/utils/config.js';
+import { toPlainObject } from 'src/utils/object.js';
+
+@Injectable()
+export class SystemConfigService extends BaseService {
+  @OnEvent({ name: 'AppBootstrap', priority: BootstrapEventPriority.SystemConfig })
+  async onBootstrap() {
+    const config = await this.getConfig({ withCache: false });
+    await this.eventRepository.emit('ConfigInit', { newConfig: config });
+  }
+
+  @OnEvent({ name: 'AppShutdown' })
+  onShutdown() {
+    this.machineLearningRepository.teardown();
+  }
+
+  async getAdminConfig(): Promise<AdminConfigDto> {
+    const config = await this.getConfig({ withCache: false });
+    return mapAdminConfig(config);
+  }
+
+  getAdminConfigDefaults(): AdminConfigDto {
+    return mapAdminConfig(defaults);
+  }
+
+  async getUserConfig(): Promise<UserConfigDto> {
+    const config = await this.getConfig({ withCache: false });
+    return mapUserConfig(config);
+  }
+
+  getUserConfigDefaults(): UserConfigDto {
+    return mapUserConfig(defaults);
+  }
+
+  async getPublicConfig(): Promise<PublicConfigDto> {
+    const config = await this.getConfig({ withCache: false });
+    return mapPublicConfig(config);
+  }
+
+  getPublicConfigDefaults(): PublicConfigDto {
+    return mapPublicConfig(defaults);
+  }
+
+  @OnEvent({ name: 'ConfigInit', priority: -100 })
+  onConfigInit({ newConfig: { logging, machineLearning } }: ArgOf<'ConfigInit'>) {
+    const { logLevel: envLevel } = this.configRepository.getEnv();
+    const configLevel = logging.enabled ? logging.level : false;
+    const level = envLevel ?? configLevel;
+    this.logger.setLogLevel(level);
+    this.logger.log(`LogLevel=${level} ${envLevel ? '(set via IMMICH_LOG_LEVEL)' : '(set via system config)'}`);
+
+    this.machineLearningRepository.setup(machineLearning);
+  }
+
+  @OnEvent({ name: 'ConfigUpdate', server: true })
+  onConfigUpdate({ newConfig }: ArgOf<'ConfigUpdate'>) {
+    this.onConfigInit({ newConfig });
+    clearConfigCache();
+  }
+
+  @OnEvent({ name: 'ConfigValidate' })
+  onConfigValidate({ newConfig, oldConfig }: ArgOf<'ConfigValidate'>) {
+    const { logLevel } = this.configRepository.getEnv();
+    if (logLevel && !isEqual(toPlainObject(newConfig.logging), oldConfig.logging)) {
+      throw new Error('Logging cannot be changed while the environment variable IMMICH_LOG_LEVEL is set.');
+    }
+  }
+
+  async updateAdminConfig(dto: AdminConfigDto): Promise<AdminConfigDto> {
+    const { configFile } = this.configRepository.getEnv();
+    if (configFile) {
+      throw new BadRequestException('Cannot update configuration while IMMICH_CONFIG_FILE is in use');
+    }
+
+    const oldConfig = await this.getConfig({ withCache: false });
+
+    try {
+      await this.eventRepository.emit('ConfigValidate', { newConfig: toPlainObject(dto), oldConfig });
+    } catch (error) {
+      this.logger.warn(`Unable to save system config due to a validation error: ${error}`);
+      throw new BadRequestException(error instanceof Error ? error.message : error);
+    }
+
+    const newConfig = await this.updateConfig(dto);
+
+    await this.eventRepository.emit('ConfigUpdate', { newConfig, oldConfig });
+
+    return mapAdminConfig(newConfig);
+  }
+
+  async getCustomCss(): Promise<string> {
+    const { theme } = await this.getConfig({ withCache: false });
+    return theme.customCss;
+  }
+}

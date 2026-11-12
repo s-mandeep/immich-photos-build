@@ -1,0 +1,229 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:ui' as ui;
+
+import 'package:async/async.dart';
+import 'package:flutter/widgets.dart';
+import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
+import 'package:immich_mobile/infrastructure/loaders/image_request.dart';
+import 'package:immich_mobile/infrastructure/repositories/settings.repository.dart';
+import 'package:immich_mobile/presentation/widgets/images/local_image_provider.dart';
+import 'package:immich_mobile/presentation/widgets/images/remote_image_provider.dart';
+import 'package:immich_mobile/presentation/widgets/timeline/constants.dart';
+import 'package:logging/logging.dart';
+
+// The provider is also the cache key and can be resolved more than once.
+// Keep mutable state per load so cancelling one cannot affect the next load.
+class ImageLoader {
+  static final _log = Logger('ImageLoader');
+
+  final ImageProvider key;
+  bool isCancelled = false;
+  bool isFinished = false;
+  ImageRequest? request;
+  CancelableOperation<ImageInfo?>? cachedOperation;
+
+  ImageLoader(this.key);
+
+  ImageInfo? getInitialImage(ImageProvider provider) {
+    final completer = CancelableCompleter<ImageInfo?>();
+    final cachedStream = provider.resolve(ImageConfiguration.empty);
+    ImageInfo? cachedImage;
+    final listener = ImageStreamListener((image, synchronousCall) {
+      if (synchronousCall) {
+        cachedImage = image;
+      }
+
+      if (!completer.isCompleted) {
+        completer.complete(image);
+      }
+    }, onError: completer.completeError);
+
+    cachedStream.addListener(listener);
+    if (cachedImage != null) {
+      cachedStream.removeListener(listener);
+      return cachedImage;
+    }
+
+    unawaited(
+      completer.operation.valueOrCancellation().whenComplete(() {
+        cachedStream.removeListener(listener);
+      }),
+    );
+    cachedOperation = completer.operation;
+    return null;
+  }
+
+  Stream<ImageInfo> loadRequest(ImageRequest request, ImageDecoderCallback decode, {required bool isFinal}) async* {
+    if (isCancelled) {
+      this.request = null;
+      return;
+    }
+
+    try {
+      final image = await request.load(decode);
+      if (isCancelled || image == null) {
+        image?.dispose();
+        return;
+      }
+      isFinished = isFinal;
+      yield image;
+    } catch (e, stack) {
+      if (isCancelled) {
+        return;
+      }
+      if (isFinal) {
+        isFinished = true;
+        PaintingBinding.instance.imageCache.evict(key);
+        rethrow;
+      }
+      _log.warning('Non-fatal image load error', e, stack);
+    } finally {
+      this.request = null;
+    }
+  }
+
+  Future<ui.Codec?> loadCodecRequest(ImageRequest request, {required bool isFinal}) async {
+    if (isCancelled) {
+      this.request = null;
+      return null;
+    }
+
+    try {
+      final codec = await request.loadCodec();
+      if (isCancelled || codec == null) {
+        codec?.dispose();
+        return null;
+      }
+      isFinished = isFinal;
+      return codec;
+    } catch (e) {
+      if (isCancelled) {
+        return null;
+      }
+      if (isFinal) {
+        isFinished = true;
+        PaintingBinding.instance.imageCache.evict(key);
+        rethrow;
+      }
+      return null;
+    } finally {
+      this.request = null;
+    }
+  }
+
+  Stream<ImageInfo> initialImageStream() async* {
+    final cachedOperation = this.cachedOperation;
+    if (isCancelled || cachedOperation == null) {
+      return;
+    }
+
+    try {
+      final cachedImage = await cachedOperation.valueOrCancellation();
+      if (isCancelled || cachedImage == null) {
+        return;
+      }
+      yield cachedImage;
+    } catch (e, stack) {
+      if (isCancelled) {
+        return;
+      }
+      _log.severe('Error loading initial image', e, stack);
+    } finally {
+      this.cachedOperation = null;
+    }
+  }
+
+  void cancel() {
+    isCancelled = true;
+    final hasActiveWork = !isFinished;
+
+    final request = this.request;
+    if (request != null) {
+      this.request = null;
+      request.cancel();
+    }
+
+    final operation = cachedOperation;
+    if (operation != null) {
+      cachedOperation = null;
+      unawaited(operation.cancel());
+    }
+
+    if (hasActiveWork) {
+      PaintingBinding.instance.imageCache.evict(key);
+    }
+  }
+}
+
+ImageProvider getFullImageProvider(
+  BaseAsset asset, {
+  Size size = const Size(1080, 1920),
+  bool edited = true,
+  String? localFilePath,
+  Size? remoteThumbnailSize,
+}) {
+  // Create new provider and cache it
+  final ImageProvider provider;
+  if (localFilePath != null) {
+    provider = FileImage(File(localFilePath));
+  } else if (_shouldUseLocalAsset(asset)) {
+    final id = asset is LocalAsset ? asset.id : (asset as RemoteAsset).localId!;
+    provider = LocalFullImageProvider(
+      id: id,
+      size: size,
+      assetType: asset.type,
+      isAnimated: asset.isAnimatedImage,
+      width: asset.width,
+      height: asset.height,
+      checksum: asset.checksum,
+    );
+  } else {
+    final String assetId;
+    final String thumbhash;
+    if (asset is LocalAsset && asset.hasRemote) {
+      assetId = asset.remoteId!;
+      thumbhash = "";
+    } else if (asset is RemoteAsset) {
+      assetId = asset.id;
+      thumbhash = asset.thumbHash ?? "";
+    } else {
+      throw ArgumentError("Unsupported asset type: ${asset.runtimeType}");
+    }
+    provider = RemoteFullImageProvider(
+      assetId: assetId,
+      thumbhash: thumbhash,
+      assetType: asset.type,
+      isAnimated: asset.isAnimatedImage,
+      edited: edited,
+      thumbnailSize: remoteThumbnailSize,
+    );
+  }
+
+  return provider;
+}
+
+ImageProvider? getThumbnailImageProvider(
+  BaseAsset asset, {
+  Size size = kThumbnailResolution,
+
+  /// Physical size to decode for remote thumbnails, or null for the source size.
+  Size? remoteSize,
+  bool edited = true,
+}) {
+  if (_shouldUseLocalAsset(asset)) {
+    final id = asset is LocalAsset ? asset.id : (asset as RemoteAsset).localId!;
+    return LocalThumbProvider(id: id, size: size, assetType: asset.type, checksum: asset.checksum);
+  }
+
+  final assetId = asset is RemoteAsset ? asset.id : (asset as LocalAsset).remoteId;
+  final thumbhash = asset is RemoteAsset ? asset.thumbHash ?? "" : "";
+  return assetId != null
+      ? RemoteImageProvider.thumbnail(assetId: assetId, thumbhash: thumbhash, edited: edited, decodeSize: remoteSize)
+      : null;
+}
+
+bool _shouldUseLocalAsset(BaseAsset asset) =>
+    asset.hasLocal &&
+    (!asset.hasRemote || !SettingsRepository.instance.appConfig.image.preferRemote) &&
+    !asset.isEdited;

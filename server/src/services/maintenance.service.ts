@@ -1,0 +1,93 @@
+import { Injectable } from '@nestjs/common';
+import type { ArgOf } from 'src/repositories/event.repository.js';
+import type { MaintenanceModeState } from 'src/types.js';
+import { OnEvent } from 'src/decorators.js';
+import {
+  MaintenanceAuthDto,
+  MaintenanceDetectInstallResponseDto,
+  MaintenanceStatusResponseDto,
+  SetMaintenanceModeDto,
+} from 'src/dtos/maintenance.dto.js';
+import { MaintenanceAction, SystemMetadataKey } from 'src/enum.js';
+import { BaseService } from 'src/services/base.service.js';
+import {
+  createMaintenanceLoginUrl,
+  detectPriorInstall,
+  generateMaintenanceSecret,
+  signMaintenanceJwt,
+} from 'src/utils/maintenance.js';
+import { getExternalDomain } from 'src/utils/misc.js';
+
+/**
+ * This service is available outside of maintenance mode to manage maintenance mode
+ */
+@Injectable()
+export class MaintenanceService extends BaseService {
+  getMaintenanceMode(): Promise<MaintenanceModeState> {
+    return this.systemMetadataRepository
+      .get(SystemMetadataKey.MaintenanceMode)
+
+      .then((state) => state ?? { isMaintenanceMode: false });
+  }
+
+  getMaintenanceStatus(): MaintenanceStatusResponseDto {
+    return {
+      active: false,
+      action: MaintenanceAction.End,
+    };
+  }
+
+  detectPriorInstall(): Promise<MaintenanceDetectInstallResponseDto> {
+    return detectPriorInstall(this.storageRepository);
+  }
+
+  async startMaintenance(action: SetMaintenanceModeDto, username: string): Promise<{ jwt: string }> {
+    const secret = generateMaintenanceSecret();
+    await this.systemMetadataRepository.set(SystemMetadataKey.MaintenanceMode, {
+      isMaintenanceMode: true,
+      secret,
+      action,
+    });
+
+    await this.eventRepository.emit('AppRestart', { isMaintenanceMode: true });
+
+    return {
+      jwt: await signMaintenanceJwt(secret, {
+        username,
+      }),
+    };
+  }
+
+  async startRestoreFlow(): Promise<{ jwt: string }> {
+    return this.startMaintenance(
+      {
+        action: MaintenanceAction.SelectDatabaseRestore,
+      },
+      'admin',
+    );
+  }
+
+  @OnEvent({ name: 'AppRestart', server: true })
+  onRestart(event: ArgOf<'AppRestart'>, ack?: (ok: 'ok') => void): void {
+    this.logger.log(`Restarting due to event... ${JSON.stringify(event)}`);
+
+    ack?.('ok');
+    this.appRepository.exitApp();
+  }
+
+  async createLoginUrl(auth: MaintenanceAuthDto, secret?: string): Promise<string> {
+    const { server } = await this.getConfig({ withCache: true });
+    const baseUrl = getExternalDomain(server);
+
+    if (!secret) {
+      const state = await this.getMaintenanceMode();
+      if (!state.isMaintenanceMode) {
+        throw new Error('Not in maintenance mode');
+      }
+
+      secret = state.secret;
+    }
+
+    return await createMaintenanceLoginUrl(baseUrl, auth, secret);
+  }
+}
