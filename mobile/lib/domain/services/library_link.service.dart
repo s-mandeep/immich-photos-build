@@ -79,8 +79,8 @@ class LibraryLinkState {
     'createdAlbums': createdAlbums,
   };
 
-  LibraryLinkState copyWith({Map<String, String>? createdAlbums}) => LibraryLinkState(
-    linkedLocalIds: linkedLocalIds,
+  LibraryLinkState copyWith({Set<String>? linkedLocalIds, Map<String, String>? createdAlbums}) => LibraryLinkState(
+    linkedLocalIds: linkedLocalIds ?? this.linkedLocalIds,
     sampled: sampled,
     equal: equal,
     summary: summary,
@@ -225,6 +225,10 @@ class LibraryLinkService {
     final hashes = {for (final m in result.matches) m.phoneId: m.server.checksum};
     await _db.localAssetRepository.updateHashes(hashes);
     final linked = {...previous.linkedLocalIds.where(localChecksum.containsKey), ...hashes.keys};
+    // Saved at once (photos-v4): if iOS stops the run after this point, the new metadata pairs are still held
+    // back from server->phone deletes by the hash gate.
+    var progressState = previous.copyWith(linkedLocalIds: linked);
+    await _saveState(userId, progressState);
 
     // remote id per local id, for every pair (new metadata pairs + earlier hash pairs).
     final remoteByChecksum = {for (final s in server) s.checksum: s};
@@ -334,7 +338,8 @@ class LibraryLinkService {
           albumsCreated++;
           createdAlbums[plan.targetKey] = newId;
           // Saved at once so an interrupted run reuses this album instead of creating a second one.
-          await _saveState(userId, previous.copyWith(createdAlbums: createdAlbums));
+          progressState = progressState.copyWith(createdAlbums: {...createdAlbums});
+          await _saveState(userId, progressState);
         } else if (albumId != null && plan.toAdd.isNotEmpty) {
           albumsReused++;
         }
